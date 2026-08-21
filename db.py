@@ -1,4 +1,5 @@
 import asyncio
+import json
 from datetime import datetime, timezone, timedelta
 from typing import Optional, List, Dict, Any
 import uuid
@@ -10,7 +11,12 @@ from google.cloud.firestore import Client as FirestoreClient
 import config
 
 # Инициализация Firebase
-cred = credentials.Certificate(config.FIREBASE_CREDENTIALS_PATH)
+if config.FIREBASE_CREDENTIALS_JSON:
+    cred_dict = json.loads(config.FIREBASE_CREDENTIALS_JSON)
+    cred = credentials.Certificate(cred_dict)
+else:
+    cred = credentials.Certificate(config.FIREBASE_CREDENTIALS_PATH)
+
 firebase_admin.initialize_app(cred)
 
 db: FirestoreClient = firestore.client()
@@ -98,7 +104,7 @@ async def delete_track(track_id: str) -> None:
 
 async def list_tracks_by_user(user_id: int) -> List[Dict[str, Any]]:
     tracks_ref = db.collection(TRACKS_COLLECTION)
-    query = tracks_ref.where('user_id', '==', user_id)  # без order_by
+    query = tracks_ref.where('user_id', '==', user_id)
     docs = await asyncio.to_thread(query.stream)
     tracks = []
     for doc in docs:
@@ -110,13 +116,12 @@ async def list_tracks_by_user(user_id: int) -> List[Dict[str, Any]]:
         data['created_at'] = _to_datetime(data.get('created_at'))
         data['expires_at'] = _to_datetime(data.get('expires_at'))
         tracks.append(data)
-    # Сортировка по created_at (новые сверху)
     tracks.sort(key=lambda x: x.get('created_at') or datetime.min.replace(tzinfo=timezone.utc), reverse=True)
     return tracks
 
 async def list_tracks_by_status(statuses: List[str]) -> List[Dict[str, Any]]:
     tracks_ref = db.collection(TRACKS_COLLECTION)
-    query = tracks_ref.where('status', 'in', statuses)  # без order_by
+    query = tracks_ref.where('status', 'in', statuses)
     docs = await asyncio.to_thread(query.stream)
     tracks = []
     for doc in docs:
@@ -142,7 +147,6 @@ async def set_admin_chat_id(chat_id: int) -> None:
     doc_ref = db.collection(CONFIG_COLLECTION).document(ADMIN_CHAT_DOC_ID)
     await asyncio.to_thread(doc_ref.set, {'chat_id': chat_id})
 
-# Уникальность названия для пользователя
 async def check_title_unique(user_id: int, title: str, exclude_track_id: Optional[str] = None) -> bool:
     tracks_ref = db.collection(TRACKS_COLLECTION)
     query = tracks_ref.where('user_id', '==', user_id).where('title', '==', title)

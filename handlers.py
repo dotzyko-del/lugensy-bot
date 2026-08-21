@@ -6,7 +6,7 @@ from typing import List, Optional
 from aiogram import Router, F, Bot
 from aiogram.filters import Command, CommandStart, StateFilter
 from aiogram.fsm.context import FSMContext
-from aiogram.types import Message, CallbackQuery, InputFile, FSInputFile
+from aiogram.types import Message, CallbackQuery, BufferedInputFile
 
 from google.cloud import firestore
 
@@ -41,15 +41,14 @@ async def send_track_to_review(bot: Bot, track_id: str):
     manager_ids = user.get('manager_ids', [])
     text = helpers.format_track_message(track)
     markup = keyboards.get_admin_review_keyboard(track_id)
-    audio_file = await helpers.get_track_audio(track)
+    audio_file = await helpers.get_track_audio(track)  # получаем один раз, но для отправки каждому нужен новый
 
     if manager_ids:
         messages = []
         for mgr_id in manager_ids:
             try:
-                if audio_file:
-                    # Важно: аудиофайл нельзя переиспользовать, поэтому создаём новый
-                    audio_for_manager = await helpers.get_track_audio(track)
+                audio_for_manager = await helpers.get_track_audio(track)  # создаём новый файл
+                if audio_for_manager:
                     msg = await bot.send_audio(mgr_id, audio=audio_for_manager, caption=text, reply_markup=markup)
                 else:
                     msg = await bot.send_message(mgr_id, text + "\n(Аудиофайл недоступен)", reply_markup=markup)
@@ -63,8 +62,8 @@ async def send_track_to_review(bot: Bot, track_id: str):
         if not admin_chat_id:
             admin_chat_id = config.TELEGRAM_ADMIN_ID
         try:
-            if audio_file:
-                audio_for_chat = await helpers.get_track_audio(track)
+            audio_for_chat = await helpers.get_track_audio(track)
+            if audio_for_chat:
                 msg = await bot.send_audio(admin_chat_id, audio=audio_for_chat, caption=text, reply_markup=markup)
             else:
                 msg = await bot.send_message(admin_chat_id, text + "\n(Аудиофайл недоступен)", reply_markup=markup)
@@ -81,26 +80,13 @@ async def delete_review_messages(bot: Bot, track: dict):
             pass
     await db.update_track(track['id'], {'review_messages': []})
 
-# --- Хэндлеры ---
-
-@router.message(CommandStart())
-async def cmd_start(message: Message, state: FSMContext):
-    await state.clear()
-    user = await db.get_user(message.from_user.id)
-    if not user:
-        # Если это главный админ, назначаем superadmin
-        role = "superadmin" if message.from_user.id == config.TELEGRAM_ADMIN_ID else "user"
-        await db.create_user(message.from_user.id, message.from_user.username or "", role)
-        await message.answer("Добро пожаловать! Отправьте аудиофайл MP3, чтобы начать.")
-    else:
-        await message.answer("С возвращением! Отправьте аудиофайл MP3 или используйте /mytracks.")
-
+# --- Команда помощи ---
 @router.message(Command("help"))
 async def cmd_help(message: Message):
     user = await db.get_user(message.from_user.id)
     role = user.get('role') if user else 'user'
     text = "📋 Список доступных команд:\n\n"
-    if role in ['admin', 'superadmin']:
+    if role in ['admin', 'superadmin'] or message.from_user.id == config.TELEGRAM_ADMIN_ID:
         text += "👑 Админ-команды:\n"
         text += "/alltracks - список треков (на проверке/одобренные)\n"
         text += "/addadmin <id> - назначить админа\n"
@@ -118,6 +104,19 @@ async def cmd_help(message: Message):
     text += "/help - эта справка\n"
     await message.answer(text)
 
+# --- Старт ---
+@router.message(CommandStart())
+async def cmd_start(message: Message, state: FSMContext):
+    await state.clear()
+    user = await db.get_user(message.from_user.id)
+    if not user:
+        role = "superadmin" if message.from_user.id == config.TELEGRAM_ADMIN_ID else "user"
+        await db.create_user(message.from_user.id, message.from_user.username or "", role)
+        await message.answer("Добро пожаловать! Отправьте аудиофайл MP3, чтобы начать.")
+    else:
+        await message.answer("С возвращением! Отправьте аудиофайл MP3 или используйте /mytracks.")
+
+# --- Обработка аудио ---
 @router.message(F.content_type.in_({'audio', 'document'}))
 async def handle_audio(message: Message):
     if message.audio:
@@ -172,8 +171,11 @@ async def handle_audio(message: Message):
         'review_messages': [],
     }
     track_id = await db.create_track(track_data)
-    await message.answer(f"Аудио получено. ID трека: {track_id}\nУ вас есть 7 дней, чтобы заполнить данные. Используйте /filldata {track_id} или /mytracks.")
+    await message.answer(
+        f"Аудио получено. ID трека: {track_id}\nУ вас есть 7 дней, чтобы заполнить данные. Используйте /filldata {track_id} или /mytracks."
+    )
 
+# --- Заполнение данных ---
 @router.message(Command("filldata"))
 async def cmd_filldata(message: Message, state: FSMContext):
     args = message.text.split()
@@ -219,11 +221,9 @@ async def process_overwrite(message: Message, state: FSMContext):
     track_id = data['track_id']
     pending_title = data.get('pending_title')
     if answer in ['да', 'yes', 'y']:
-        # Удаляем старый трек с таким названием
         old_tracks = await db.list_tracks_by_user(message.from_user.id)
         for old_track in old_tracks:
             if old_track.get('title') == pending_title and old_track['id'] != track_id:
-                # Удаляем файл из Supabase
                 if old_track.get('object_key'):
                     await storage.delete_file(old_track['object_key'])
                 await db.delete_track(old_track['id'])
@@ -275,6 +275,7 @@ async def process_wav_link(message: Message, state: FSMContext):
         "Вы можете отправить его на проверку командой /submit <track_id> или /mytracks."
     )
 
+# --- Отправка на проверку ---
 @router.message(Command("submit"))
 async def cmd_submit(message: Message):
     args = message.text.split()
@@ -298,6 +299,7 @@ async def cmd_submit(message: Message):
     await send_track_to_review(message.bot, track_id)
     await message.answer("Трек отправлен на проверку.")
 
+# --- Редактирование ---
 @router.message(Command("edit"))
 async def cmd_edit(message: Message, state: FSMContext):
     args = message.text.split()
@@ -312,7 +314,6 @@ async def cmd_edit(message: Message, state: FSMContext):
     if track['status'] == 'approved':
         await message.answer("Одобренные треки нельзя редактировать.")
         return
-    # Если трек был на проверке, отзываем его
     if track['status'] == 'submitted':
         await delete_review_messages(message.bot, track)
         await db.update_track(track_id, {'status': 'data_filled', 'expires_at': datetime.now(timezone.utc) + timedelta(days=3)})
@@ -326,7 +327,6 @@ async def process_edit_choice(message: Message, state: FSMContext):
     choice = message.text.strip()
     data = await state.get_data()
     track_id = data['track_id']
-    track = await db.get_track(track_id)
     if choice in ['1', 'аудиофайл']:
         await state.set_state(states.EditData.waiting_for_file)
         await message.answer("Отправьте новый аудиофайл MP3.")
@@ -349,7 +349,6 @@ async def process_edit_choice(message: Message, state: FSMContext):
 async def process_edit_file(message: Message, state: FSMContext):
     data = await state.get_data()
     track_id = data['track_id']
-    # Скачиваем новый файл, загружаем в Supabase, обновляем track
     if message.audio:
         if message.audio.mime_type != 'audio/mpeg':
             await message.answer("Поддерживаются только MP3 файлы.")
@@ -370,11 +369,9 @@ async def process_edit_file(message: Message, state: FSMContext):
     except Exception as e:
         await message.answer("Не удалось скачать файл.")
         return
-    # Удаляем старый файл
     old_track = await db.get_track(track_id)
     if old_track.get('object_key'):
         await storage.delete_file(old_track['object_key'])
-    # Загружаем новый
     new_object_key = f"tracks/{file_id}.mp3"
     await storage.upload_file(file_bytes.read(), new_object_key)
     await db.update_track(track_id, {
@@ -401,8 +398,10 @@ async def process_edit_title(message: Message, state: FSMContext):
     await message.answer("Название обновлено.")
     await state.clear()
 
-# Аналогично для других полей (можно реализовать по аналогии)
+# Аналогично можно добавить обработчики для остальных полей редактирования,
+# но для краткости они опущены (можно добавить позже по аналогии).
 
+# --- Удаление ---
 @router.message(Command("delete"))
 async def cmd_delete(message: Message):
     args = message.text.split()
@@ -417,12 +416,12 @@ async def cmd_delete(message: Message):
     if track['status'] == 'approved':
         await message.answer("Одобренные треки нельзя удалить.")
         return
-    # Подтверждение (упрощённо без FSM, просто удаляем)
     if track.get('object_key'):
         await storage.delete_file(track['object_key'])
     await db.delete_track(track_id)
     await message.answer("Трек удалён.")
 
+# --- Список треков пользователя ---
 @router.message(Command("mytracks"))
 async def cmd_mytracks(message: Message):
     tracks = await db.list_tracks_by_user(message.from_user.id)
@@ -453,7 +452,7 @@ async def process_mytrack_click(callback: CallbackQuery):
         await callback.answer("Трек не найден.")
         return
     text = helpers.format_track_message(track, show_status=True)
-    text += f"\nID трека: {track['id']}"
+    text += f"\nID трека: {track['id']}"   # добавлено
     audio_file = await helpers.get_track_audio(track)
     if audio_file:
         await callback.message.answer_audio(audio=audio_file, caption=text)
@@ -461,7 +460,7 @@ async def process_mytrack_click(callback: CallbackQuery):
         await callback.message.answer(text)
     await callback.answer()
 
-# Админские команды
+# --- Админские команды ---
 @router.message(Command("addadmin"))
 async def cmd_addadmin(message: Message):
     if not await is_superadmin(message.from_user.id):
@@ -478,6 +477,9 @@ async def cmd_addadmin(message: Message):
     else:
         await db.create_user(admin_id, "", "admin")
     await message.answer(f"Пользователь {admin_id} назначен администратором.")
+    # Обновляем команды для нового админа (позже можно вынести в main, но для простоты здесь)
+    # Для Render в main.py уже есть set_commands, которая при старте назначает всем,
+    # но здесь можно не делать.
 
 @router.message(Command("removeadmin"))
 async def cmd_removeadmin(message: Message):
@@ -552,6 +554,7 @@ async def cmd_setadminchat(message: Message):
     await db.set_admin_chat_id(chat_id)
     await message.answer(f"Общий чат установлен: {chat_id}")
 
+# --- Обработка callback для админов ---
 @router.callback_query(F.data.startswith("approve:"))
 async def process_approve(callback: CallbackQuery):
     if not await is_admin(callback.from_user.id):
@@ -623,6 +626,7 @@ async def process_reject_comment(message: Message, state: FSMContext):
     await message.answer("Трек отклонён.")
     await state.clear()
 
+# --- Список всех треков для админов ---
 @router.message(Command("alltracks"))
 async def cmd_alltracks(message: Message):
     if not await is_admin(message.from_user.id):
@@ -665,6 +669,7 @@ async def process_alltrack_click(callback: CallbackQuery):
         await callback.message.answer(text)
     await callback.answer()
 
+# --- Пагинация ---
 @router.callback_query(F.data.startswith("page:"))
 async def process_pagination(callback: CallbackQuery):
     parts = callback.data.split(":")
