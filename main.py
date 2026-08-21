@@ -57,13 +57,25 @@ async def on_shutdown(app):
     await bot.delete_webhook()
     await bot.session.close()
 
+# async def handle_webhook(request):
+#     bot = request.app['bot']
+#     dp = request.app['dp']
+#     data = await request.json()
+#     update = Update.model_validate(data, context={"bot": bot})
+#     await dp.feed_webhook_update(update)
+#     return web.Response()
+
 async def handle_webhook(request):
-    bot = request.app['bot']
-    dp = request.app['dp']
+    bot = request.app["bot"]
+    dp = request.app["dp"]
+
     data = await request.json()
     update = Update.model_validate(data, context={"bot": bot})
-    await dp.feed_webhook_update(update)
-    return web.Response()
+
+    await dp.feed_webhook_update(bot, update)
+
+    return web.Response(status=200, text="OK")
+
 
 def main():
     os.makedirs("logs", exist_ok=True)
