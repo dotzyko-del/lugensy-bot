@@ -50,7 +50,7 @@ async def get_file_bytes(object_key: str) -> Optional[bytes]:
         return result
     except Exception as e:
         print(f"Download error for {object_key}: {e}")
-        return None
+    return await download_via_signed_url(object_key)
 
 async def get_signed_url(object_key: str, expires_in: int = 3600) -> Optional[str]:
     """Get a signed URL for downloading the file (fallback method)."""
