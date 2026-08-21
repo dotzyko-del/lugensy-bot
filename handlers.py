@@ -165,10 +165,8 @@ async def handle_audio(message: Message):
         return
 
     object_key = f"tracks/{file_id}.mp3"
-    try:
-        await storage.upload_file(file_bytes.read(), object_key)
-    except Exception as e:
-        print(f"Upload error: {e}")
+    upload_success = await storage.upload_file(file_bytes.read(), object_key)
+    if not upload_success:
         await message.answer("Не удалось загрузить файл в хранилище. Попробуйте ещё раз позже.")
         return
 
@@ -445,10 +443,8 @@ async def process_edit_file(message: Message, state: FSMContext):
             print(f"Delete old file error: {e}")
 
     new_object_key = f"tracks/{file_id}.mp3"
-    try:
-        await storage.upload_file(file_bytes.read(), new_object_key)
-    except Exception as e:
-        print(f"Upload new file error: {e}")
+    upload_success = await storage.upload_file(file_bytes.read(), new_object_key)
+    if not upload_success:
         await message.answer("Не удалось загрузить новый файл в хранилище.")
         return
 
