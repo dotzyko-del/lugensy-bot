@@ -65,14 +65,18 @@ async def handle_webhook(request):
     await dp.feed_webhook_update(update)
     return web.Response()
 
-async def main():
-    # Логирование
+def main():
     os.makedirs("logs", exist_ok=True)
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
         handlers=[
-            TimedRotatingFileHandler(config.LOG_FILE, when="midnight", backupCount=1, encoding="utf-8"),
+            TimedRotatingFileHandler(
+                config.LOG_FILE,
+                when="midnight",
+                backupCount=1,
+                encoding="utf-8"
+            ),
             logging.StreamHandler()
         ]
     )
@@ -82,29 +86,72 @@ async def main():
     dp = Dispatcher(storage=MemoryStorage())
     dp.include_router(handlers.router)
 
-    # Запуск планировщика
     scheduler = setup_scheduler(bot)
-    scheduler.start()
 
     if config.WEBHOOK_URL:
-        # Режим webhook
         app = web.Application()
-        app['bot'] = bot
-        app['dp'] = dp
+
+        app["bot"] = bot
+        app["dp"] = dp
+        app["scheduler"] = scheduler
+        app["logger"] = logger
+
         app.router.add_post(config.WEBHOOK_PATH, handle_webhook)
         app.on_startup.append(on_startup)
         app.on_shutdown.append(on_shutdown)
+
         logger.info("Starting webhook server...")
-        web.run_app(app, host="0.0.0.0", port=config.PORT)
+        web.run_app(app, host="0.0.0.0", port=int(config.PORT))
     else:
-        # Режим polling (для локальной разработки)
         logger.info("Starting polling...")
-        await set_commands(bot)
-        try:
-            await dp.start_polling(bot)
-        finally:
-            await bot.session.close()
-            scheduler.shutdown()
+        asyncio.run(run_polling(bot, dp, scheduler))
+
+
+async def run_polling(bot, dp, scheduler):
+    await set_commands(bot)
+    scheduler.start()
+    try:
+        await dp.start_polling(bot)
+    finally:
+        await bot.session.close()
+        scheduler.shutdown()
+
+
+async def on_startup(app: web.Application):
+    bot = app["bot"]
+    scheduler = app["scheduler"]
+    logger = app["logger"]
+
+    await set_commands(bot)
+    scheduler.start()
+
+    logger.info("Setting webhook...")
+    await bot.set_webhook(
+        url=config.WEBHOOK_URL,
+        drop_pending_updates=True
+    )
+    logger.info("Webhook set successfully")
+
+
+async def on_shutdown(app: web.Application):
+    bot = app["bot"]
+    scheduler = app["scheduler"]
+    logger = app["logger"]
+
+    logger.info("Shutting down...")
+    try:
+        await bot.delete_webhook(drop_pending_updates=False)
+    except Exception as e:
+        logger.exception("Failed to delete webhook: %s", e)
+
+    try:
+        scheduler.shutdown()
+    except Exception as e:
+        logger.exception("Failed to stop scheduler: %s", e)
+
+    await bot.session.close()
+    logger.info("Shutdown complete")
+
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
