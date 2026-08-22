@@ -10,6 +10,7 @@ from aiogram.types import BotCommand, BotCommandScopeChat, Update
 from aiohttp import web
 
 import config
+import commands
 import handlers
 import db
 from scheduler import setup_scheduler
@@ -18,26 +19,16 @@ logger = logging.getLogger(__name__)
 
 
 async def set_commands(bot: Bot):
-    # Общие команды
+    # Commands visible to everyone.
     await bot.set_my_commands([
-        BotCommand(command="start", description="Начать"),
-        BotCommand(command="help", description="Помощь"),
-        BotCommand(command="mytracks", description="Мои треки"),
-        BotCommand(command="filldata", description="Заполнить данные"),
-        BotCommand(command="submit", description="Отправить на проверку"),
-        BotCommand(command="edit", description="Изменить трек"),
-        BotCommand(command="delete", description="Удалить трек"),
+        BotCommand(command=cmd, description=desc) for cmd, desc in commands.USER_COMMANDS
     ])
 
-    # Админские команды для каждого администратора
+    # Extra commands visible only in each admin's own chat.
     admins = await db.get_all_admins()
     admin_commands = [
-        BotCommand(command="alltracks", description="Список треков"),
-        BotCommand(command="addadmin", description="Добавить админа"),
-        BotCommand(command="removeadmin", description="Убрать админа"),
-        BotCommand(command="setmanager", description="Назначить менеджера"),
-        BotCommand(command="unsetmanager", description="Убрать менеджера"),
-        BotCommand(command="setadminchat", description="Установить чат"),
+        BotCommand(command=cmd, description=desc)
+        for cmd, desc in (commands.USER_COMMANDS + commands.ADMIN_COMMANDS)
     ]
     for admin in admins:
         try:
@@ -97,15 +88,14 @@ async def on_shutdown(app: web.Application):
 
 def setup_logging():
     handlers_list = [
-        # Explicit stdout, line-buffered by the logging module itself
-        # (StreamHandler flushes on every emitted record), so this always
-        # reaches Render's Logs tab regardless of PYTHONUNBUFFERED.
+        # Explicit stdout, and StreamHandler flushes on every emitted record,
+        # so this always reaches Render's Logs tab regardless of buffering.
         logging.StreamHandler(stream=sys.stdout)
     ]
 
     # File logging only makes sense for local development - Render's
-    # filesystem is ephemeral and you can't browse it without shell access.
-    # Skip it in production (Render sets the RENDER env var automatically).
+    # filesystem is ephemeral and invisible without shell access.
+    # Render sets the RENDER env var automatically in production.
     if not os.getenv("RENDER"):
         os.makedirs("logs", exist_ok=True)
         handlers_list.append(

@@ -1,4 +1,3 @@
-import asyncio
 import logging
 from datetime import datetime, timedelta, timezone
 from typing import Optional
@@ -15,6 +14,7 @@ import db
 import storage
 import keyboards
 import states
+import commands
 from utils import helpers
 
 logger = logging.getLogger(__name__)
@@ -62,7 +62,7 @@ async def send_track_to_review(bot: Bot, track_id: str):
                 else:
                     msg = await bot.send_message(mgr_id, text + "\n(Аудиофайл недоступен)", reply_markup=markup)
                 messages.append({"chat_id": mgr_id, "message_id": msg.message_id})
-            except Exception as e:
+            except Exception:
                 logger.exception(f"Failed to send to manager {mgr_id}")
         if messages:
             await db.update_track(track_id, {"review_messages": messages})
@@ -77,7 +77,7 @@ async def send_track_to_review(bot: Bot, track_id: str):
             else:
                 msg = await bot.send_message(admin_chat_id, text + "\n(Аудиофайл недоступен)", reply_markup=markup)
             await db.update_track(track_id, {"review_messages": [{"chat_id": admin_chat_id, "message_id": msg.message_id}]})
-        except Exception as e:
+        except Exception:
             logger.exception("Failed to send to admin chat")
 
 
@@ -91,30 +91,131 @@ async def delete_review_messages(bot: Bot, track: dict):
     await db.update_track(track["id"], {"review_messages": []})
 
 
+# ---------------------------------------------------------------------------
+# Shared track-action logic.
+# Each of these is called from BOTH a slash command (with an ID typed by the
+# user) and an inline-button callback (with an ID embedded in callback_data),
+# so the behavior can never drift between the two entry points.
+# Each returns a single user-facing string; the caller decides whether to
+# send it via message.answer(...) or callback.answer(..., show_alert=True).
+# ---------------------------------------------------------------------------
+
+async def start_fill_or_edit_flow(bot: Bot, state: FSMContext, track_id: str, user_id: int) -> str:
+    track = await db.get_track(track_id)
+    if not track or track["user_id"] != user_id:
+        return "Трек не найден или не принадлежит вам."
+    if track["status"] == "approved":
+        return "Одобренные треки нельзя изменять."
+
+    if track["status"] == "pending_data":
+        # Nothing filled in yet - walk through all fields from scratch.
+        await state.set_state(states.FillData.waiting_for_title)
+        await state.update_data(track_id=track_id, edit_mode=False)
+        return "Введите название трека:"
+
+    # data_filled / rejected / submitted - offer the field-by-field edit menu.
+    if track["status"] == "submitted":
+        await delete_review_messages(bot, track)
+        await db.update_track(track_id, {
+            "status": "data_filled",
+            "expires_at": datetime.now(timezone.utc) + timedelta(days=3),
+        })
+    await state.set_state(states.EditData.waiting_for_choice)
+    await state.update_data(track_id=track_id)
+    return (
+        "Что вы хотите изменить?\n"
+        "1. Аудиофайл\n2. Название\n3. Исполнителей\n4. Авторов музыки\n5. Ссылку на WAV\n"
+        "Отправьте номер или текст:"
+    )
+
+
+async def do_submit_track(bot: Bot, track_id: str, user_id: int) -> str:
+    track = await db.get_track(track_id)
+    if not track or track["user_id"] != user_id:
+        return "Трек не найден или не принадлежит вам."
+    if track["status"] not in ["data_filled", "rejected"]:
+        return "Трек нельзя отправить на проверку из текущего статуса."
+    await db.update_track(track_id, {
+        "status": "submitted",
+        "submitted_at": firestore.SERVER_TIMESTAMP,
+        "expires_at": datetime.now(timezone.utc) + timedelta(days=3),
+        "reminded_at": None,
+    })
+    await send_track_to_review(bot, track_id)
+    return "Трек отправлен на проверку."
+
+
+async def do_withdraw_track(bot: Bot, track_id: str, user_id: int) -> str:
+    track = await db.get_track(track_id)
+    if not track or track["user_id"] != user_id:
+        return "Трек не найден или не принадлежит вам."
+    if track["status"] != "submitted":
+        return "Трек не находится на проверке."
+    await delete_review_messages(bot, track)
+    await db.update_track(track_id, {
+        "status": "data_filled",
+        "expires_at": datetime.now(timezone.utc) + timedelta(days=3),
+        "reminded_at": None,
+    })
+    return "Трек отозван с проверки. Статус: «Данные заполнены»."
+
+
+async def do_delete_track(track_id: str, user_id: int) -> str:
+    track = await db.get_track(track_id)
+    if not track or track["user_id"] != user_id:
+        return "Трек не найден или не принадлежит вам."
+    if track["status"] == "approved":
+        return "Одобренные треки нельзя удалить."
+    if track.get("object_key"):
+        try:
+            await storage.delete_file(track["object_key"])
+        except Exception:
+            logger.exception("Delete track storage error")
+    await db.delete_track(track_id)
+    return "Трек удалён."
+
+
+async def do_extend_track(track_id: str, user_id: int) -> str:
+    track = await db.get_track(track_id)
+    if not track or track["user_id"] != user_id:
+        return "Трек не найден или не принадлежит вам."
+    if track["status"] == "approved" or track["status"].startswith("pending"):
+        return "Этот трек нельзя продлить."
+    if track.get("extended_once"):
+        return "Вы уже продлевали срок хранения этого трека."
+    base = track.get("expires_at") or datetime.now(timezone.utc)
+    new_expires = base + timedelta(days=3)
+    await db.update_track(track_id, {
+        "expires_at": new_expires,
+        "extended_once": True,
+        "reminded_at": None,
+    })
+    return f"Срок хранения продлён до {new_expires.strftime('%Y-%m-%d %H:%M')} UTC."
+
+
+# ---------------------------------------------------------------------------
+# /help
+# ---------------------------------------------------------------------------
 @router.message(Command("help"))
 async def cmd_help(message: Message):
-    user = await db.get_user(message.from_user.id)
-    role = user.get("role") if user else "user"
+    admin = await is_admin(message.from_user.id)
     text = "📋 Список доступных команд:\n\n"
-    if role in ["admin", "superadmin"] or message.from_user.id == config.TELEGRAM_ADMIN_ID:
-        text += "👑 Админ-команды:\n"
-        text += "/alltracks - список треков (на проверке/одобренные)\n"
-        text += "/addadmin - назначить админа\n"
-        text += "/removeadmin - убрать админа\n"
-        text += "/setmanager - назначить менеджера\n"
-        text += "/unsetmanager - убрать менеджера\n"
-        text += "/setadminchat - установить общий чат\n\n"
     text += "👤 Пользовательские команды:\n"
-    text += "/start - приветствие\n"
-    text += "/mytracks - мои треки\n"
-    text += "/filldata - заполнить данные\n"
-    text += "/submit - отправить на проверку\n"
-    text += "/edit - изменить трек\n"
-    text += "/delete - удалить трек\n"
-    text += "/help - эта справка\n"
-    await message.answer(text)
+    text += commands.format_command_list(commands.USER_COMMANDS)
+    if admin:
+        text += "\n\n👑 Админ-команды:\n"
+        text += commands.format_command_list(commands.ADMIN_COMMANDS)
+    await message.answer(text, reply_markup=keyboards.get_main_menu_keyboard(admin))
 
 
+@router.message(F.text == keyboards.BTN_HELP)
+async def button_help(message: Message):
+    await cmd_help(message)
+
+
+# ---------------------------------------------------------------------------
+# /start
+# ---------------------------------------------------------------------------
 @router.message(CommandStart())
 async def cmd_start(message: Message, state: FSMContext):
     await state.clear()
@@ -122,9 +223,11 @@ async def cmd_start(message: Message, state: FSMContext):
     if not user:
         role = "superadmin" if message.from_user.id == config.TELEGRAM_ADMIN_ID else "user"
         await db.create_user(message.from_user.id, message.from_user.username or "", role)
-        await message.answer("Добро пожаловать! Отправьте аудиофайл MP3, чтобы начать.")
+        greeting = "Добро пожаловать! Отправьте аудиофайл MP3, чтобы начать."
     else:
-        await message.answer("С возвращением! Отправьте аудиофайл MP3 или используйте /mytracks.")
+        greeting = "С возвращением! Отправьте аудиофайл MP3 или используйте меню ниже."
+    admin = await is_admin(message.from_user.id)
+    await message.answer(greeting, reply_markup=keyboards.get_main_menu_keyboard(admin))
 
 
 @router.message(F.content_type == ContentType.STICKER)
@@ -136,6 +239,9 @@ async def handle_sticker(message: Message, state: FSMContext):
         await message.answer("Стикеры пока не поддерживаются. Отправь MP3-файл или команду.")
 
 
+# ---------------------------------------------------------------------------
+# Uploading a new track
+# ---------------------------------------------------------------------------
 @router.message(F.content_type.in_({ContentType.AUDIO, ContentType.DOCUMENT}))
 async def handle_audio(message: Message):
     if message.audio:
@@ -161,7 +267,7 @@ async def handle_audio(message: Message):
     try:
         file = await message.bot.get_file(file_id)
         file_bytes = await message.bot.download_file(file.file_path)
-    except Exception as e:
+    except Exception:
         logger.exception("Download error")
         await message.answer("Не удалось скачать файл.")
         return
@@ -195,32 +301,26 @@ async def handle_audio(message: Message):
         "review_messages": [],
     }
     track_id = await db.create_track(track_data)
+    markup = keyboards.get_track_actions_keyboard(track_id, "pending_data")
     await message.answer(
-        f"Аудио получено. ID трека: {track_id}\nУ вас есть 7 дней, чтобы заполнить данные. Используйте /filldata {track_id} или /mytracks."
+        f"Аудио получено. ID трека: {track_id}\n"
+        f"У вас есть 7 дней, чтобы заполнить данные.",
+        reply_markup=markup,
     )
 
 
+# ---------------------------------------------------------------------------
+# /filldata <id>  (full fill-in-order flow for a fresh track)
+# ---------------------------------------------------------------------------
 @router.message(Command("filldata"))
 async def cmd_filldata(message: Message, state: FSMContext):
     text = safe_text(message)
-    if not text:
-        await message.answer("Укажите ID трека: /filldata <ID>")
-        return
-    args = text.split()
+    args = text.split() if text else []
     if len(args) < 2:
         await message.answer("Укажите ID трека: /filldata <ID>")
         return
-    track_id = args[1]
-    track = await db.get_track(track_id)
-    if not track or track["user_id"] != message.from_user.id:
-        await message.answer("Трек не найден или не принадлежит вам.")
-        return
-    if track["status"] == "approved":
-        await message.answer("Одобренные треки нельзя изменять.")
-        return
-    await state.set_state(states.FillData.waiting_for_title)
-    await state.update_data(track_id=track_id, edit_mode=False)
-    await message.answer("Введите название трека:")
+    result = await start_fill_or_edit_flow(message.bot, state, args[1], message.from_user.id)
+    await message.answer(result)
 
 
 @router.message(StateFilter(states.FillData.waiting_for_title))
@@ -264,7 +364,7 @@ async def process_overwrite(message: Message, state: FSMContext):
                 if old_track.get("object_key"):
                     try:
                         await storage.delete_file(old_track["object_key"])
-                    except Exception as e:
+                    except Exception:
                         logger.exception("Delete storage error")
                 await db.delete_track(old_track["id"])
                 break
@@ -322,64 +422,62 @@ async def process_wav_link(message: Message, state: FSMContext):
     }
     await db.update_track(track_id, update_data)
     await state.clear()
+    markup = keyboards.get_track_actions_keyboard(track_id, "data_filled")
     await message.answer(
-        "Данные сохранены. Трек теперь в статусе «Данные заполнены».\n"
-        "Вы можете отправить его на проверку командой /submit или /mytracks."
+        "Данные сохранены. Трек теперь в статусе «Данные заполнены».",
+        reply_markup=markup,
     )
 
 
+# ---------------------------------------------------------------------------
+# /submit <id>
+# ---------------------------------------------------------------------------
 @router.message(Command("submit"))
 async def cmd_submit(message: Message):
     text = safe_text(message)
-    if not text:
-        await message.answer("Укажите ID трека: /submit <ID>")
-        return
-    args = text.split()
+    args = text.split() if text else []
     if len(args) < 2:
         await message.answer("Укажите ID трека: /submit <ID>")
         return
-    track_id = args[1]
+    result = await do_submit_track(message.bot, args[1], message.from_user.id)
+    await message.answer(result)
+
+
+@router.callback_query(F.data.startswith("submit_track:"))
+async def cb_submit_track(callback: CallbackQuery):
+    track_id = callback.data.split(":", 1)[1]
+    result = await do_submit_track(callback.bot, track_id, callback.from_user.id)
+    await callback.answer(result, show_alert=True)
     track = await db.get_track(track_id)
-    if not track or track["user_id"] != message.from_user.id:
-        await message.answer("Трек не найден или не принадлежит вам.")
-        return
-    if track["status"] not in ["data_filled", "rejected"]:
-        await message.answer("Трек нельзя отправить на проверку из текущего статуса.")
-        return
-    await db.update_track(track_id, {
-        "status": "submitted",
-        "submitted_at": firestore.SERVER_TIMESTAMP,
-        "expires_at": datetime.now(timezone.utc) + timedelta(days=3),
-        "reminded_at": None,
-    })
-    await send_track_to_review(message.bot, track_id)
-    await message.answer("Трек отправлен на проверку.")
+    if track:
+        try:
+            await callback.message.edit_reply_markup(
+                reply_markup=keyboards.get_track_actions_keyboard(track_id, track["status"])
+            )
+        except Exception:
+            pass
 
 
+# ---------------------------------------------------------------------------
+# /edit <id>  (menu-driven edit of one field at a time)
+# ---------------------------------------------------------------------------
 @router.message(Command("edit"))
 async def cmd_edit(message: Message, state: FSMContext):
     text = safe_text(message)
-    if not text:
-        await message.answer("Укажите ID трека: /edit <ID>")
-        return
-    args = text.split()
+    args = text.split() if text else []
     if len(args) < 2:
         await message.answer("Укажите ID трека: /edit <ID>")
         return
-    track_id = args[1]
-    track = await db.get_track(track_id)
-    if not track or track["user_id"] != message.from_user.id:
-        await message.answer("Трек не найден или не принадлежит вам.")
-        return
-    if track["status"] == "approved":
-        await message.answer("Одобренные треки нельзя редактировать.")
-        return
-    if track["status"] == "submitted":
-        await delete_review_messages(message.bot, track)
-        await db.update_track(track_id, {"status": "data_filled", "expires_at": datetime.now(timezone.utc) + timedelta(days=3)})
-    await state.set_state(states.EditData.waiting_for_choice)
-    await state.update_data(track_id=track_id)
-    await message.answer("Что вы хотите изменить?\n1. Аудиофайл\n2. Название\n3. Исполнителей\n4. Авторов музыки\n5. Ссылку на WAV\nОтправьте номер или текст:")
+    result = await start_fill_or_edit_flow(message.bot, state, args[1], message.from_user.id)
+    await message.answer(result)
+
+
+@router.callback_query(F.data.startswith("edit_track:"))
+async def cb_edit_track(callback: CallbackQuery, state: FSMContext):
+    track_id = callback.data.split(":", 1)[1]
+    result = await start_fill_or_edit_flow(callback.bot, state, track_id, callback.from_user.id)
+    await callback.message.answer(result)
+    await callback.answer()
 
 
 @router.message(StateFilter(states.EditData.waiting_for_choice))
@@ -432,7 +530,7 @@ async def process_edit_file(message: Message, state: FSMContext):
     try:
         file = await message.bot.get_file(file_id)
         file_bytes = await message.bot.download_file(file.file_path)
-    except Exception as e:
+    except Exception:
         logger.exception("Download error on edit")
         await message.answer("Не удалось скачать файл.")
         return
@@ -441,7 +539,7 @@ async def process_edit_file(message: Message, state: FSMContext):
     if old_track and old_track.get("object_key"):
         try:
             await storage.delete_file(old_track["object_key"])
-        except Exception as e:
+        except Exception:
             logger.exception("Delete old file error")
 
     new_object_key = f"tracks/{file_id}.mp3"
@@ -456,7 +554,7 @@ async def process_edit_file(message: Message, state: FSMContext):
         "original_filename": file_name or f"{file_id}.mp3",
         "file_size": file_size,
         "status": "data_filled",
-        "expires_at": datetime.now(timezone.utc) + timedelta(days=3)
+        "expires_at": datetime.now(timezone.utc) + timedelta(days=3),
     })
     await message.answer("Файл обновлён.")
     await state.clear()
@@ -479,38 +577,131 @@ async def process_edit_title(message: Message, state: FSMContext):
     if not unique:
         await message.answer("Название занято. Выберите другое.")
         return
-    await db.update_track(track_id, {"title": title, "status": "data_filled", "expires_at": datetime.now(timezone.utc) + timedelta(days=3)})
+    await db.update_track(track_id, {
+        "title": title,
+        "status": "data_filled",
+        "expires_at": datetime.now(timezone.utc) + timedelta(days=3),
+    })
     await message.answer("Название обновлено.")
     await state.clear()
 
 
+# NOTE: these two handlers were entirely missing before - selecting "3" or
+# "4" in the edit menu set the FSM state but had nowhere to go, so the
+# user's next message fell through to the generic fallback handler.
+@router.message(StateFilter(states.EditData.waiting_for_artists))
+async def process_edit_artists(message: Message, state: FSMContext):
+    artists_text = safe_text(message)
+    if artists_text is None:
+        await message.answer("Нужен текстовый ответ. Введите исполнителей сообщением.")
+        return
+    artists = [a.strip() for a in artists_text.split(",") if a.strip()]
+    data = await state.get_data()
+    track_id = data["track_id"]
+    await db.update_track(track_id, {
+        "artists": artists,
+        "status": "data_filled",
+        "expires_at": datetime.now(timezone.utc) + timedelta(days=3),
+    })
+    await message.answer("Исполнители обновлены.")
+    await state.clear()
+
+
+@router.message(StateFilter(states.EditData.waiting_for_music_authors))
+async def process_edit_music_authors(message: Message, state: FSMContext):
+    authors_text = safe_text(message)
+    if authors_text is None:
+        await message.answer("Нужен текстовый ответ. Введите авторов музыки сообщением.")
+        return
+    authors = [a.strip() for a in authors_text.split(",") if a.strip()]
+    data = await state.get_data()
+    track_id = data["track_id"]
+    await db.update_track(track_id, {
+        "music_authors": authors,
+        "status": "data_filled",
+        "expires_at": datetime.now(timezone.utc) + timedelta(days=3),
+    })
+    await message.answer("Авторы музыки обновлены.")
+    await state.clear()
+
+
+@router.message(StateFilter(states.EditData.waiting_for_wav_link))
+async def process_edit_wav_link(message: Message, state: FSMContext):
+    link = safe_text(message)
+    if link is None:
+        await message.answer("Нужен текстовый ответ. Введите ссылку или '-'.")
+        return
+    if link == "-":
+        link = None
+    data = await state.get_data()
+    track_id = data["track_id"]
+    await db.update_track(track_id, {
+        "wav_link": link,
+        "status": "data_filled",
+        "expires_at": datetime.now(timezone.utc) + timedelta(days=3),
+    })
+    await message.answer("Ссылка на WAV обновлена.")
+    await state.clear()
+
+
+# ---------------------------------------------------------------------------
+# /delete <id>
+# ---------------------------------------------------------------------------
 @router.message(Command("delete"))
 async def cmd_delete(message: Message):
     text = safe_text(message)
-    if not text:
-        await message.answer("Укажите ID трека: /delete <ID>")
-        return
-    args = text.split()
+    args = text.split() if text else []
     if len(args) < 2:
         await message.answer("Укажите ID трека: /delete <ID>")
         return
-    track_id = args[1]
+    result = await do_delete_track(args[1], message.from_user.id)
+    await message.answer(result)
+
+
+@router.callback_query(F.data.startswith("delete_track:"))
+async def cb_delete_track(callback: CallbackQuery):
+    track_id = callback.data.split(":", 1)[1]
+    result = await do_delete_track(track_id, callback.from_user.id)
+    await callback.answer(result, show_alert=True)
+    try:
+        await callback.message.delete()
+    except Exception:
+        pass
+
+
+# ---------------------------------------------------------------------------
+# Withdraw / extend (previously buttons only, no handlers at all)
+# ---------------------------------------------------------------------------
+@router.callback_query(F.data.startswith("withdraw_track:"))
+async def cb_withdraw_track(callback: CallbackQuery):
+    track_id = callback.data.split(":", 1)[1]
+    result = await do_withdraw_track(callback.bot, track_id, callback.from_user.id)
+    await callback.answer(result, show_alert=True)
     track = await db.get_track(track_id)
-    if not track or track["user_id"] != message.from_user.id:
-        await message.answer("Трек не найден или не принадлежит вам.")
-        return
-    if track["status"] == "approved":
-        await message.answer("Одобренные треки нельзя удалить.")
-        return
-    if track.get("object_key"):
+    if track:
         try:
-            await storage.delete_file(track["object_key"])
-        except Exception as e:
-            logger.exception("Delete track storage error")
-    await db.delete_track(track_id)
-    await message.answer("Трек удалён.")
+            await callback.message.edit_reply_markup(
+                reply_markup=keyboards.get_track_actions_keyboard(track_id, track["status"])
+            )
+        except Exception:
+            pass
 
 
+@router.callback_query(F.data.startswith("extend_track:"))
+async def cb_extend_track(callback: CallbackQuery):
+    track_id = callback.data.split(":", 1)[1]
+    result = await do_extend_track(track_id, callback.from_user.id)
+    await callback.answer(result, show_alert=True)
+
+
+@router.callback_query(F.data == "ignore")
+async def cb_ignore(callback: CallbackQuery):
+    await callback.answer()
+
+
+# ---------------------------------------------------------------------------
+# /mytracks and the "📁 Мои треки" button
+# ---------------------------------------------------------------------------
 @router.message(Command("mytracks"))
 async def cmd_mytracks(message: Message):
     tracks = await db.list_tracks_by_user(message.from_user.id)
@@ -519,18 +710,21 @@ async def cmd_mytracks(message: Message):
         return
     page = 0
     total_pages = (len(tracks) + 6) // 7
-    start = page * 7
-    end = start + 7
-    page_tracks = tracks[start:end]
+    page_tracks = tracks[page * 7: page * 7 + 7]
     display_items = []
     for t in page_tracks:
         status_emoji = helpers.get_status_emoji(t["status"])
         display_text = f"{status_emoji} {t.get('title') or t.get('original_filename')}"
         if t.get("artists"):
             display_text = f"{status_emoji} {', '.join(t['artists'])} - {t.get('title', '')}"
-        display_items.append({"id": t["id"], "display_text": display_text, "track": t})
+        display_items.append({"id": t["id"], "display_text": display_text})
     markup = keyboards.get_pagination_keyboard(display_items, page, total_pages, prefix="mytrack")
     await message.answer("Ваши треки:", reply_markup=markup)
+
+
+@router.message(F.text == keyboards.BTN_MY_TRACKS)
+async def button_my_tracks(message: Message):
+    await cmd_mytracks(message)
 
 
 @router.callback_query(F.data.startswith("mytrack:"))
@@ -543,24 +737,25 @@ async def process_mytrack_click(callback: CallbackQuery):
         return
     text = helpers.format_track_message(track, show_status=True)
     text += f"\nID трека: {track['id']}"
+    markup = keyboards.get_track_actions_keyboard(track_id, track["status"])
     audio_file = await helpers.get_track_audio(track)
     if audio_file:
-        await callback.message.answer_audio(audio=audio_file, caption=text)
+        await callback.message.answer_audio(audio=audio_file, caption=text, reply_markup=markup)
     else:
-        await callback.message.answer(text)
+        await callback.message.answer(text, reply_markup=markup)
     await callback.answer()
 
 
+# ---------------------------------------------------------------------------
+# Admin: add/remove admins, managers, admin chat
+# ---------------------------------------------------------------------------
 @router.message(Command("addadmin"))
 async def cmd_addadmin(message: Message):
     if not await is_superadmin(message.from_user.id):
         await message.answer("Недостаточно прав.")
         return
     text = safe_text(message)
-    if not text:
-        await message.answer("Укажите Telegram ID: /addadmin <ID>")
-        return
-    args = text.split()
+    args = text.split() if text else []
     if len(args) < 2:
         await message.answer("Укажите Telegram ID: /addadmin <ID>")
         return
@@ -570,7 +765,10 @@ async def cmd_addadmin(message: Message):
         await db.update_user(admin_id, {"role": "admin"})
     else:
         await db.create_user(admin_id, "", "admin")
-    await message.answer(f"Пользователь {admin_id} назначен администратором.")
+    await message.answer(
+        f"Пользователь {admin_id} назначен администратором.\n"
+        "Попросите его отправить /start, чтобы обновить меню."
+    )
 
 
 @router.message(Command("removeadmin"))
@@ -579,10 +777,7 @@ async def cmd_removeadmin(message: Message):
         await message.answer("Недостаточно прав.")
         return
     text = safe_text(message)
-    if not text:
-        await message.answer("Укажите Telegram ID: /removeadmin <ID>")
-        return
-    args = text.split()
+    args = text.split() if text else []
     if len(args) < 2:
         await message.answer("Укажите Telegram ID: /removeadmin <ID>")
         return
@@ -601,10 +796,7 @@ async def cmd_setmanager(message: Message):
         await message.answer("Недостаточно прав.")
         return
     text = safe_text(message)
-    if not text:
-        await message.answer("Использование: /setmanager <user_id> <admin_id>")
-        return
-    args = text.split()
+    args = text.split() if text else []
     if len(args) < 3:
         await message.answer("Использование: /setmanager <user_id> <admin_id>")
         return
@@ -630,10 +822,7 @@ async def cmd_unsetmanager(message: Message):
         await message.answer("Недостаточно прав.")
         return
     text = safe_text(message)
-    if not text:
-        await message.answer("Использование: /unsetmanager <user_id> <admin_id>")
-        return
-    args = text.split()
+    args = text.split() if text else []
     if len(args) < 3:
         await message.answer("Использование: /unsetmanager <user_id> <admin_id>")
         return
@@ -658,10 +847,7 @@ async def cmd_setadminchat(message: Message):
         chat_id = message.reply_to_message.chat.id
     else:
         text = safe_text(message)
-        if not text:
-            await message.answer("Используйте команду в ответе на сообщение из нужного чата или укажите ID: /setadminchat <ID>")
-            return
-        args = text.split()
+        args = text.split() if text else []
         if len(args) < 2:
             await message.answer("Используйте команду в ответе на сообщение из нужного чата или укажите ID: /setadminchat <ID>")
             return
@@ -670,6 +856,9 @@ async def cmd_setadminchat(message: Message):
     await message.answer(f"Общий чат установлен: {chat_id}")
 
 
+# ---------------------------------------------------------------------------
+# Admin review: approve / reject
+# ---------------------------------------------------------------------------
 @router.callback_query(F.data.startswith("approve:"))
 async def process_approve(callback: CallbackQuery):
     if not await is_admin(callback.from_user.id):
@@ -747,6 +936,9 @@ async def process_reject_comment(message: Message, state: FSMContext):
     await state.clear()
 
 
+# ---------------------------------------------------------------------------
+# /alltracks and the "📋 Все треки" button (admin only)
+# ---------------------------------------------------------------------------
 @router.message(Command("alltracks"))
 async def cmd_alltracks(message: Message):
     if not await is_admin(message.from_user.id):
@@ -759,9 +951,7 @@ async def cmd_alltracks(message: Message):
         return
     page = 0
     total_pages = (len(tracks) + 6) // 7
-    start = page * 7
-    end = start + 7
-    page_tracks = tracks[start:end]
+    page_tracks = tracks[page * 7: page * 7 + 7]
     display_items = []
     for t in page_tracks:
         status_emoji = helpers.get_status_emoji(t["status"])
@@ -769,6 +959,11 @@ async def cmd_alltracks(message: Message):
         display_items.append({"id": t["id"], "display_text": display_text})
     markup = keyboards.get_pagination_keyboard(display_items, page, total_pages, prefix="alltrack")
     await message.answer("Все треки (submitted/approved):", reply_markup=markup)
+
+
+@router.message(F.text == keyboards.BTN_ALL_TRACKS)
+async def button_all_tracks(message: Message):
+    await cmd_alltracks(message)
 
 
 @router.callback_query(F.data.startswith("alltrack:"))
@@ -809,9 +1004,7 @@ async def process_pagination(callback: CallbackQuery):
     total_pages = (len(tracks) + 6) // 7
     if page < 0 or page >= total_pages:
         page = 0
-    start = page * 7
-    end = start + 7
-    page_tracks = tracks[start:end]
+    page_tracks = tracks[page * 7: page * 7 + 7]
     display_items = []
     for t in page_tracks:
         status_emoji = helpers.get_status_emoji(t["status"])
@@ -824,6 +1017,9 @@ async def process_pagination(callback: CallbackQuery):
     await callback.answer()
 
 
+# ---------------------------------------------------------------------------
+# Fallback
+# ---------------------------------------------------------------------------
 @router.message()
 async def fallback_message(message: Message, state: FSMContext):
     current_state = await state.get_state()
@@ -833,4 +1029,4 @@ async def fallback_message(message: Message, state: FSMContext):
     if current_state:
         await message.answer("Неподдерживаемый формат. Отправьте текстовое сообщение.")
         return
-    await message.answer("Поддерживаются команды, текст и MP3-файлы.")
+    await message.answer("Поддерживаются команды, текст, MP3-файлы и кнопки меню ниже.")

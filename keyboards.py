@@ -1,6 +1,32 @@
-from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
-from aiogram.utils.keyboard import InlineKeyboardBuilder
+from aiogram.types import (
+    InlineKeyboardMarkup,
+    InlineKeyboardButton,
+    ReplyKeyboardMarkup,
+    KeyboardButton,
+)
+from aiogram.utils.keyboard import InlineKeyboardBuilder, ReplyKeyboardBuilder
 
+# ---------------------------------------------------------------------------
+# Reply keyboard (persistent bottom menu) — button labels are matched
+# against incoming message text in handlers.py, so keep these in sync
+# with the F.text filters there.
+# ---------------------------------------------------------------------------
+BTN_MY_TRACKS = "📁 Мои треки"
+BTN_HELP = "❓ Помощь"
+BTN_ALL_TRACKS = "📋 Все треки"
+
+
+def get_main_menu_keyboard(is_admin: bool = False) -> ReplyKeyboardMarkup:
+    builder = ReplyKeyboardBuilder()
+    builder.row(KeyboardButton(text=BTN_MY_TRACKS), KeyboardButton(text=BTN_HELP))
+    if is_admin:
+        builder.row(KeyboardButton(text=BTN_ALL_TRACKS))
+    return builder.as_markup(resize_keyboard=True, is_persistent=True)
+
+
+# ---------------------------------------------------------------------------
+# Inline keyboards
+# ---------------------------------------------------------------------------
 def get_track_actions_keyboard(track_id: str, status: str) -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
     if status in ['pending_data', 'data_filled', 'rejected']:
@@ -16,6 +42,7 @@ def get_track_actions_keyboard(track_id: str, status: str) -> InlineKeyboardMark
     builder.adjust(1)
     return builder.as_markup()
 
+
 def get_pagination_keyboard(items: list, page: int, total_pages: int, prefix: str) -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
     for item in items:
@@ -29,6 +56,7 @@ def get_pagination_keyboard(items: list, page: int, total_pages: int, prefix: st
         nav_buttons.append(InlineKeyboardButton(text="➡️", callback_data=f"page:{prefix}:{page+1}"))
     builder.row(*nav_buttons)
     return builder.as_markup()
+
 
 def get_admin_review_keyboard(track_id: str) -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
