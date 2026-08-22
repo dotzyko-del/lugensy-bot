@@ -1,4 +1,5 @@
 import asyncio
+import logging
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
@@ -16,6 +17,7 @@ import keyboards
 import states
 from utils import helpers
 
+logger = logging.getLogger(__name__)
 router = Router()
 
 
@@ -61,7 +63,7 @@ async def send_track_to_review(bot: Bot, track_id: str):
                     msg = await bot.send_message(mgr_id, text + "\n(Аудиофайл недоступен)", reply_markup=markup)
                 messages.append({"chat_id": mgr_id, "message_id": msg.message_id})
             except Exception as e:
-                print(f"Failed to send to manager {mgr_id}: {e}")
+                logger.exception(f"Failed to send to manager {mgr_id}")
         if messages:
             await db.update_track(track_id, {"review_messages": messages})
     else:
@@ -76,7 +78,7 @@ async def send_track_to_review(bot: Bot, track_id: str):
                 msg = await bot.send_message(admin_chat_id, text + "\n(Аудиофайл недоступен)", reply_markup=markup)
             await db.update_track(track_id, {"review_messages": [{"chat_id": admin_chat_id, "message_id": msg.message_id}]})
         except Exception as e:
-            print(f"Failed to send to admin chat: {e}")
+            logger.exception("Failed to send to admin chat")
 
 
 async def delete_review_messages(bot: Bot, track: dict):
@@ -160,7 +162,7 @@ async def handle_audio(message: Message):
         file = await message.bot.get_file(file_id)
         file_bytes = await message.bot.download_file(file.file_path)
     except Exception as e:
-        print(f"Download error: {e}")
+        logger.exception("Download error")
         await message.answer("Не удалось скачать файл.")
         return
 
@@ -263,7 +265,7 @@ async def process_overwrite(message: Message, state: FSMContext):
                     try:
                         await storage.delete_file(old_track["object_key"])
                     except Exception as e:
-                        print(f"Delete storage error: {e}")
+                        logger.exception("Delete storage error")
                 await db.delete_track(old_track["id"])
                 break
         await state.update_data(title=pending_title, overwrite_done=True)
@@ -431,7 +433,7 @@ async def process_edit_file(message: Message, state: FSMContext):
         file = await message.bot.get_file(file_id)
         file_bytes = await message.bot.download_file(file.file_path)
     except Exception as e:
-        print(f"Download error on edit: {e}")
+        logger.exception("Download error on edit")
         await message.answer("Не удалось скачать файл.")
         return
 
@@ -440,7 +442,7 @@ async def process_edit_file(message: Message, state: FSMContext):
         try:
             await storage.delete_file(old_track["object_key"])
         except Exception as e:
-            print(f"Delete old file error: {e}")
+            logger.exception("Delete old file error")
 
     new_object_key = f"tracks/{file_id}.mp3"
     upload_success = await storage.upload_file(file_bytes.read(), new_object_key)
@@ -504,7 +506,7 @@ async def cmd_delete(message: Message):
         try:
             await storage.delete_file(track["object_key"])
         except Exception as e:
-            print(f"Delete track storage error: {e}")
+            logger.exception("Delete track storage error")
     await db.delete_track(track_id)
     await message.answer("Трек удалён.")
 

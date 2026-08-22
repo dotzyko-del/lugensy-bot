@@ -1,10 +1,13 @@
 import asyncio
 import io
+import logging
 import httpx
 from typing import Optional
 from supabase import create_client, Client
 
 import config
+
+logger = logging.getLogger(__name__)
 
 _supabase: Optional[Client] = None
 
@@ -20,11 +23,15 @@ async def upload_file(file_bytes: bytes, object_key: str) -> bool:
             get_supabase().storage.from_(config.SUPABASE_BUCKET).upload,
             path=object_key,
             file=file_bytes,
+            # Supabase Storage only honors the "x-upsert" header (sent as a
+            # lowercase string). "upsert" (without the x- prefix) is silently
+            # ignored, so re-uploading to an existing object_key returns a
+            # 400 "Asset already exists" error.
             file_options={"content-type": "audio/mpeg", "x-upsert": "true"}
         )
         return True
-    except Exception as e:
-        print(f"Upload error: {e}")
+    except Exception:
+        logger.exception(f"Upload error for {object_key}")
         return False
 
 async def delete_file(object_key: str) -> bool:
@@ -34,8 +41,8 @@ async def delete_file(object_key: str) -> bool:
             [object_key]
         )
         return True
-    except Exception as e:
-        print(f"Delete error: {e}")
+    except Exception:
+        logger.exception(f"Delete error for {object_key}")
         return False
 
 async def get_file_bytes(object_key: str) -> Optional[bytes]:
@@ -45,11 +52,11 @@ async def get_file_bytes(object_key: str) -> Optional[bytes]:
             object_key
         )
         if result is None:
-            print(f"Download returned None for {object_key}")
+            logger.warning(f"Download returned None for {object_key}")
             return None
         return result
-    except Exception as e:
-        print(f"Download error for {object_key}: {e}")
+    except Exception:
+        logger.exception(f"Download error for {object_key}")
     return await download_via_signed_url(object_key)
 
 async def get_signed_url(object_key: str, expires_in: int = 3600) -> Optional[str]:
@@ -64,10 +71,10 @@ async def get_signed_url(object_key: str, expires_in: int = 3600) -> Optional[st
             return result["signedURL"]
         if result and result.get("signedUrl"):
             return result["signedUrl"]
-        print(f"Signed URL response: {result}")
+        logger.warning(f"Unexpected signed URL response for {object_key}: {result}")
         return None
-    except Exception as e:
-        print(f"Signed URL error for {object_key}: {e}")
+    except Exception:
+        logger.exception(f"Signed URL error for {object_key}")
         return None
 
 async def download_via_signed_url(object_key: str) -> Optional[bytes]:
@@ -80,6 +87,6 @@ async def download_via_signed_url(object_key: str) -> Optional[bytes]:
             response = await client.get(signed_url)
             response.raise_for_status()
             return response.content
-    except Exception as e:
-        print(f"HTTP download error for {object_key}: {e}")
+    except Exception:
+        logger.exception(f"HTTP download error for {object_key}")
         return None

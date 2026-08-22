@@ -1,4 +1,5 @@
 import asyncio
+import logging
 from datetime import datetime, timedelta, timezone
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.interval import IntervalTrigger
@@ -7,6 +8,8 @@ from google.cloud import firestore
 
 import db
 import storage
+
+logger = logging.getLogger(__name__)
 
 bot = None  # будет установлен в setup_scheduler
 
@@ -26,7 +29,7 @@ async def check_expired_tracks():
                     f"🕒 Ваш трек «{track.get('title', track.get('original_filename', 'Без названия'))}» был автоматически удалён, так как истёк срок хранения."
                 )
             except Exception as e:
-                print(f"Error notifying user: {e}")
+                logger.exception("Error notifying user")
 
 async def send_reminders():
     now = datetime.now(timezone.utc)
@@ -42,7 +45,7 @@ async def send_reminders():
                 await bot.send_message(track['user_id'], text)
                 await db.update_track(track['id'], {'reminded_at': firestore.SERVER_TIMESTAMP})
             except Exception as e:
-                print(f"Error sending reminder: {e}")
+                logger.exception("Error sending reminder")
 
 def setup_scheduler(bot_instance):
     global bot
