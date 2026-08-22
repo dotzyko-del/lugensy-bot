@@ -44,18 +44,18 @@ async def set_commands(bot: Bot):
         except Exception as e:
             print(f"Failed to set admin commands for {admin['telegram_id']}: {e}")
 
-async def on_startup(app):
-    bot = app['bot']
-    # Установка вебхука
-    webhook_url = f"{config.WEBHOOK_URL}{config.WEBHOOK_PATH}"
-    await bot.set_webhook(webhook_url, drop_pending_updates=True)
-    await set_commands(bot)
-    print(f"Webhook set to {webhook_url}")
+# async def on_startup(app):
+#     bot = app['bot']
+#     # Установка вебхука
+#     webhook_url = f"{config.WEBHOOK_URL}{config.WEBHOOK_PATH}"
+#     await bot.set_webhook(webhook_url, drop_pending_updates=True)
+#     await set_commands(bot)
+#     print(f"Webhook set to {webhook_url}")
 
-async def on_shutdown(app):
-    bot = app['bot']
-    await bot.delete_webhook()
-    await bot.session.close()
+# async def on_shutdown(app):
+#     bot = app['bot']
+#     await bot.delete_webhook()
+#     await bot.session.close()
 
 # async def handle_webhook(request):
 #     bot = request.app['bot']
@@ -138,8 +138,9 @@ async def on_startup(app: web.Application):
     scheduler.start()
 
     logger.info("Setting webhook...")
+    webhook_url = f"{config.WEBHOOK_URL}{config.WEBHOOK_PATH}"
     await bot.set_webhook(
-        url=config.WEBHOOK_URL,
+        url=webhook_url,
         drop_pending_updates=True
     )
     logger.info("Webhook set successfully")

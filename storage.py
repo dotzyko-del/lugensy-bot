@@ -20,7 +20,7 @@ async def upload_file(file_bytes: bytes, object_key: str) -> bool:
             get_supabase().storage.from_(config.SUPABASE_BUCKET).upload,
             path=object_key,
             file=file_bytes,
-            file_options={"content-type": "audio/mpeg", "upsert": "true"}
+            file_options={"content-type": "audio/mpeg", "x-upsert": "true"}
         )
         return True
     except Exception as e:
